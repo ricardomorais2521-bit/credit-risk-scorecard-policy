@@ -937,95 +937,262 @@ plt.tight_layout()
 plt.show()
 
 
-# %% 9. EXPECTED PROFIT AND CUT-OFF WITH SENSITIVITY  (Q2)
-# Interest and exposure per loan come from loan_amnt and installment. We compute:
-#   expected profit  (uses PD, LGD, funding cost)  -> basis of the decision
-#   realised profit  (uses the cash actually received) -> check that the assumptions are sensible
+# %% 9. ECONOMICS, PROFIT AND CUT-OFF  (Q2)
+# Four steps:
+#   9.1 Measure the economic parameters on DEVELOPMENT outcomes instead of assuming them.
+#   9.2 Profit by approval rate on the test vintage: expected vs realised, with sensitivity.
+#   9.3 Why expected and realised differ: the profit bridge.
+#   9.4 Policies fixed ex-ante on development, evaluated out of time on the test vintage.
 
-def expected_profit(df, lgd, funding, pd_mult=1.0):
-    """Expected profit per loan: (1 - PD) x interest - PD x LGD x EAD - funding cost."""
+# ---- Building blocks ---------------------------------------------------------
+def contractual_interest(df):
+    """Interest a loan earns if every instalment is paid on time for the full 36 months."""
+    return df["installment"] * 36 - df["loan_amnt"]
+
+
+def cash_in(df):
+    """Cash actually received: principal + interest + recoveries.
+    Late fees and collection costs are not loaded, so this is only approximately exact."""
+    return df["total_rec_prncp"] + df["total_rec_int"] + df["recoveries"]
+
+
+def funding_cost(df, funding):
+    """Cost of the money lent: annual rate x amount x average life of the funds (years)."""
+    return funding * df["loan_amnt"] * AVG_LIFE_YEARS
+
+
+def expected_profit(df, lgd, funding, pd_mult=1.0, interest_factor=1.0):
+    """Expected profit per loan, computed BEFORE the outcome is known:
+         (1 - PD) x interest_factor x contractual interest  -  PD x LGD x EAD  -  funding cost
+    interest_factor < 1 accounts for prepayment (interest actually earned vs promised).
+    Needs a column 'pd' in df."""
     p = np.clip(df["pd"] * pd_mult, 0, 1)                      # (stressed) PD, kept inside [0, 1]
-    ead = df["loan_amnt"]                                      # exposure at default = original amount
-    interest = df["installment"] * 36 - df["loan_amnt"]        # contractual interest if repaid in full (36 payments)
-    funding_cost = funding * ead * AVG_LIFE_YEARS              # cost of funds over the average outstanding life
-    return (1 - p) * interest - p * lgd * ead - funding_cost
+    interest = interest_factor * contractual_interest(df)
+    return (1 - p) * interest - p * lgd * df["loan_amnt"] - funding_cost(df, funding)
 
 
 def realised_profit(df, funding):
-    """Realised profit per loan: cash received - amount lent - funding cost.
-    Cash received = principal + interest + recoveries (late fees are not loaded, so this is slightly conservative)."""
-    cash_in = df["total_rec_prncp"] + df["total_rec_int"] + df["recoveries"]
-    return cash_in - df["loan_amnt"] - funding * df["loan_amnt"] * AVG_LIFE_YEARS
+    """Realised profit per loan, computed AFTER the outcome: cash received - amount lent - funding cost."""
+    return cash_in(df) - df["loan_amnt"] - funding_cost(df, funding)
 
 
-# Diagnostic: total_pymnt should be close to the sum of the components (the gap = late fees).
-gap = (ranked["total_pymnt"] - (ranked["total_rec_prncp"] + ranked["total_rec_int"] + ranked["recoveries"]))
-print(f"\nDiagnostic total_pymnt - (principal + interest + recoveries): mean = {gap.mean():.2f}, "
-      f"share of loans with |gap| > 1 = {(gap.abs() > 1).mean():.1%}")
+def totals_at(per_loan_profit, n_list):
+    """Total profit if we approve the first n loans (safest first), for each n in n_list.
+    A leading 0 makes n = 0 (approve nobody) a valid option with profit 0."""
+    cum = np.concatenate([[0.0], per_loan_profit.cumsum().to_numpy()])
+    return cum[np.asarray(n_list)]
 
-# Scenarios for the sensitivity analysis: (LGD, funding cost, PD multiplier).
+
+# ---- 9.1 Economic parameters measured on development ------------------------
+good_dev = dev_eng[dev_eng["bad"] == 0]
+bad_dev = dev_eng[dev_eng["bad"] == 1]
+# phi: share of the contractual interest that good loans really pay (below 1 because of prepayment).
+phi_dev = good_dev["total_rec_int"].sum() / contractual_interest(good_dev).sum()
+# lam: net loss rate on defaulted loans, after instalments paid before default and recoveries.
+lam_dev = (bad_dev["loan_amnt"] - cash_in(bad_dev)).sum() / bad_dev["loan_amnt"].sum()
+
+good_te, bad_te = test_eng[test_eng["bad"] == 0], test_eng[test_eng["bad"] == 1]
+phi_te = good_te["total_rec_int"].sum() / contractual_interest(good_te).sum()
+lam_te = (bad_te["loan_amnt"] - cash_in(bad_te)).sum() / bad_te["loan_amnt"].sum()
+print("\nEconomic parameters measured on outcomes:")
+print(f"  Interest actually earned / contractual (good loans):  dev {phi_dev:.3f} | test {phi_te:.3f}  (assumed in base case: 1.000)")
+print(f"  Net loss rate on defaulted loans (measured LGD):      dev {lam_dev:.3f} | test {lam_te:.3f}  (assumed in base case: {LGD_BASE:.3f})")
+
+# Diagnostic: total_pymnt should be close to principal + interest + recoveries (the gap = late fees).
+gap = test_eng["total_pymnt"] - cash_in(test_eng)
+print(f"  Check total_pymnt - cash_in: mean = {gap.mean():.2f}, share of loans with |gap| > 1 = {(gap.abs() > 1).mean():.1%}")
+
+# ---- 9.2 Profit by approval rate on the test vintage ------------------------
+ranked = test_eng.sort_values("pd").reset_index(drop=True)     # safest first
+shares_ext = np.round(np.concatenate([[0.0], np.arange(0.10, 1.0001, 0.05)]), 2)   # 0% = approve nobody
+counts = np.array([int(round(q * len(ranked))) for q in shares_ext])               # approved loans at each rate
+
+# Scenarios: (LGD, funding cost, PD multiplier, interest factor). The first six are assumptions;
+# the last two use the parameters measured on development.
 scenarios = {
-    "Base":              (LGD_BASE, FUNDING_BASE, 1.0),
-    "Funding 3%":        (LGD_BASE, 0.03, 1.0),
-    "Funding 7%":        (LGD_BASE, 0.07, 1.0),
-    "LGD 60%":           (0.60, FUNDING_BASE, 1.0),
-    "LGD 70%":           (0.70, FUNDING_BASE, 1.0),
-    f"PD stress x{PD_STRESS:.1f}": (LGD_BASE, FUNDING_BASE, PD_STRESS),
+    "Base (assumed)":                  (LGD_BASE, FUNDING_BASE, 1.0, 1.0),
+    "Funding 3%":                      (LGD_BASE, 0.03, 1.0, 1.0),
+    "Funding 7%":                      (LGD_BASE, 0.07, 1.0, 1.0),
+    "LGD 60%":                         (0.60, FUNDING_BASE, 1.0, 1.0),
+    "LGD 70%":                         (0.70, FUNDING_BASE, 1.0, 1.0),
+    f"PD stress x{PD_STRESS:.1f}":     (LGD_BASE, FUNDING_BASE, PD_STRESS, 1.0),
+    "Calibrated on dev":               (lam_dev, FUNDING_BASE, 1.0, phi_dev),
+    f"Calibrated + PD stress x{PD_STRESS:.1f}": (lam_dev, FUNDING_BASE, PD_STRESS, phi_dev),
 }
 
-n_total = len(ranked)
-counts = np.array([int(round(q * n_total)) for q in shares])    # approved loans at each approval rate
-bad_rate_by_q = policy["bad_rate"].to_numpy()                   # observed bad rate at each approval rate
-summary_rows, curves = [], {}
-for name, (lgd, funding, mult) in scenarios.items():
-    cum = expected_profit(ranked, lgd, funding, mult).cumsum().to_numpy()   # profit if we approve the first n loans
-    totals = cum[counts - 1]                                    # total expected profit at each approval rate
-    curves[name] = totals
-    i = int(np.argmax(totals))                                  # approval rate that maximises expected profit
-    summary_rows.append({"scenario": name, "best_approval_rate": shares[i],
-                         "pd_cutoff": policy["pd_cutoff"].iloc[i],
-                         "expected_profit": totals[i], "bad_rate_at_best": bad_rate_by_q[i]})
-sens = pd.DataFrame(summary_rows)
-print("\nProfit-maximising cut-off by scenario (unconstrained):")
-print(sens.round(4).to_string(index=False))
+rows, exp_curves = [], {}
+for name, (lgd, fund, mult, phi) in scenarios.items():
+    totals = totals_at(expected_profit(ranked, lgd, fund, mult, phi), counts)      # expected profit at every approval rate
+    exp_curves[name] = totals
+    i = int(np.argmax(totals))                                                      # best approval rate (0 = approve nobody)
+    n_i = counts[i]
+    rows.append({
+        "scenario": name,
+        "best_approval_rate": shares_ext[i],
+        "pd_cutoff": ranked["pd"].iloc[n_i - 1] if n_i > 0 else np.nan,
+        "bad_rate": ranked["bad"].iloc[:n_i].mean() if n_i > 0 else np.nan,
+        "expected_profit_M": totals[i] / 1e6,
+        "realised_profit_same_cut_M": totals_at(realised_profit(ranked, fund), counts)[i] / 1e6,
+        "verdict": "NO PROFITABLE CUT-OFF" if i == 0 else "",
+    })
+print("\nProfit-maximising approval rate by scenario (0% = lending is not profitable at any cut-off):")
+print(pd.DataFrame(rows).round(4).to_string(index=False))
 
-# Realised profit curve for the base funding cost (uses actual outcomes of the test vintage).
-realised_cum = realised_profit(ranked, FUNDING_BASE).cumsum().to_numpy()
-realised_totals = realised_cum[counts - 1]
-
-# Constrained optimum: maximise expected profit subject to the risk appetite.
-ok = bad_rate_by_q <= RISK_APPETITE
-if ok.any():
-    base_totals = np.where(ok, curves["Base"], -np.inf)         # forbid approval rates above the appetite
-    j = int(np.argmax(base_totals))
-    print(f"\nRecommended (base, bad rate <= {RISK_APPETITE:.0%}): approve {shares[j]:.0%} of applicants, "
-          f"PD cut-off {policy['pd_cutoff'].iloc[j]:.3f}, bad rate {bad_rate_by_q[j]:.2%}, "
-          f"expected profit {curves['Base'][j]:,.0f}, realised profit {realised_totals[j]:,.0f}")
-else:
-    print(f"\nNo approval rate respects the risk appetite of {RISK_APPETITE:.0%}; revisit the appetite or the model.")
+realised_by_funding = {f: totals_at(realised_profit(ranked, f), counts) for f in (0.03, 0.05, 0.07)}
+curve_table = pd.DataFrame({
+    "approval_rate": shares_ext,
+    "n_approved": counts,
+    "expected_base_M": exp_curves["Base (assumed)"] / 1e6,
+    "expected_calibrated_M": exp_curves["Calibrated on dev"] / 1e6,
+    "realised_fund3_M": realised_by_funding[0.03] / 1e6,
+    "realised_fund5_M": realised_by_funding[0.05] / 1e6,
+    "realised_fund7_M": realised_by_funding[0.07] / 1e6,
+})
+print("\nTotal profit by approval rate (USD million, test vintage):")
+print(curve_table.round(2).to_string(index=False))
 
 plt.figure(figsize=(8, 4.5))
-for name, totals in curves.items():
-    plt.plot(shares * 100, totals / 1e6, label=f"Expected: {name}")
-plt.plot(shares * 100, realised_totals / 1e6, color="black", linewidth=2, label="Realised (base funding)")
+plt.plot(shares_ext * 100, curve_table["expected_base_M"], label="Expected, assumed economics")
+plt.plot(shares_ext * 100, curve_table["expected_calibrated_M"], label="Expected, economics calibrated on dev")
+plt.plot(shares_ext * 100, curve_table["realised_fund5_M"], color="black", linewidth=2, label="Realised (funding 5%)")
+plt.plot(shares_ext * 100, curve_table["realised_fund3_M"], color="grey", linestyle="--", label="Realised (funding 3%)")
+plt.plot(shares_ext * 100, curve_table["realised_fund7_M"], color="grey", linestyle=":", label="Realised (funding 7%)")
+plt.axhline(0, color="red", linewidth=0.8)
 plt.xlabel("Approval rate (%)")
 plt.ylabel("Total profit (USD million)")
-plt.title("Profit by approval rate and scenario")
+plt.title(f"Profit by approval rate (test {TEST_YEAR})")
 plt.legend(fontsize=7)
 plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
 
 
+# ---- 9.3 Profit bridge: why expected and realised profit differ -------------
+# Each step replaces ONE assumption by what really happened. Funding cost is the same in the
+# expected and the realised formulas, so it cannot explain the gap.
+def profit_bridge(app, lgd=LGD_BASE, funding=FUNDING_BASE):
+    """Return the bridge from expected to realised profit for a set of approved loans (USD million)."""
+    bad = app["bad"]                                                     # actual outcome: 1 = bad
+    interest, ead, fund = contractual_interest(app), app["loan_amnt"], funding_cost(app, funding)
+    s0 = expected_profit(app, lgd, funding).sum()                       # PD, contractual interest, assumed LGD
+    s1 = ((1 - bad) * interest - bad * lgd * ead - fund).sum()          # actual defaults instead of PD
+    s2 = ((1 - bad) * app["total_rec_int"] - bad * lgd * ead - fund).sum()   # + interest really earned on good loans
+    s3 = ((1 - bad) * app["total_rec_int"] + bad * (cash_in(app) - ead) - fund).sum()   # + real cash result on bad loans
+    s4 = realised_profit(app, funding).sum()                            # realised profit
+    return pd.DataFrame({"USD_million": [s0 / 1e6, (s1 - s0) / 1e6, (s2 - s1) / 1e6, (s3 - s2) / 1e6,
+                                         (s4 - s3) / 1e6, s4 / 1e6]},
+                        index=["Expected profit (PD, contractual interest, assumed LGD)",
+                               "1) Actual defaults instead of PD (calibration of the level)",
+                               "2) Interest really earned instead of contractual (prepayment)",
+                               "3) Real cash result on defaults instead of assumed LGD",
+                               "4) Residual (principal shortfalls on good loans, rounding)",
+                               "Realised profit"]).round(2)
+
+
+bridge_cuts = {"Expected-profit optimum (base)": shares_ext[int(np.argmax(exp_curves["Base (assumed)"]))]}
+if len(within):                                                        # appetite-constrained cut from section 8
+    bridge_cuts[f"Largest approval within {RISK_APPETITE:.0%} bad rate"] = best_app["approval_rate"]
+for label, share in bridge_cuts.items():
+    n_cut = int(round(share * len(ranked)))
+    if n_cut == 0:
+        continue
+    print(f"\nProfit bridge at approval rate {share:.0%} - {label}:")
+    print(profit_bridge(ranked.iloc[:n_cut]).to_string())
+
+
+# ---- 9.4 Policies fixed on development, evaluated out of time ---------------
+# A cut-off chosen with the test outcomes would make the test result optimistic. Here every
+# policy is defined with development data only and then applied, unchanged, to the test vintage.
+dev_ranked = dev_eng.sort_values("pd").reset_index(drop=True)
+dev_counts = np.array([int(round(q * len(dev_ranked))) for q in shares_ext])
+dev_cum_bad = np.concatenate([[0], dev_ranked["bad"].cumsum().to_numpy()])      # cumulative bad loans, safest first
+
+
+def evaluate(df, mask):
+    """Approval rate, bad rate, mean PD and profit (expected and realised) of the loans selected by mask."""
+    app = df[mask]
+    if len(app) == 0:
+        return {"approval_rate": 0.0, "bad_rate": np.nan, "mean_pd": np.nan, "expected_base_M": 0.0,
+                "expected_calibrated_M": 0.0, "realised_M": 0.0}
+    return {"approval_rate": len(app) / len(df), "bad_rate": app["bad"].mean(), "mean_pd": app["pd"].mean(),
+            "expected_base_M": expected_profit(app, LGD_BASE, FUNDING_BASE).sum() / 1e6,
+            "expected_calibrated_M": expected_profit(app, lam_dev, FUNDING_BASE, 1.0, phi_dev).sum() / 1e6,
+            "realised_M": realised_profit(app, FUNDING_BASE).sum() / 1e6}
+
+
+policies = {}                                                          # name -> function(df) returning a mask
+
+# Policy A: largest approval rate whose DEVELOPMENT bad rate stays within the risk appetite.
+ok_n = [n for n in dev_counts if n > 0 and dev_cum_bad[n] / n <= RISK_APPETITE]
+if ok_n:
+    t_A = dev_ranked["pd"].iloc[max(ok_n) - 1]                         # PD threshold fixed on development
+    policies[f"A: risk appetite {RISK_APPETITE:.0%} (PD <= {t_A:.3f})"] = lambda df, t=t_A: df["pd"] <= t
+
+# Policy B: approval rate that maximises expected profit on development (assumed economics).
+dev_totals = totals_at(expected_profit(dev_ranked, LGD_BASE, FUNDING_BASE), dev_counts)
+n_B = dev_counts[int(np.argmax(dev_totals))]
+if n_B > 0:
+    t_B = dev_ranked["pd"].iloc[n_B - 1]
+    policies[f"B: max expected profit, assumed economics (PD <= {t_B:.3f})"] = lambda df, t=t_B: df["pd"] <= t
+
+# Policy C: break-even rule. Approve a loan only if its expected profit, with the economics
+# measured on development, is positive. The implied bad rate is the risk appetite the economics justify.
+policies["C: break-even rule, economics calibrated on dev"] = (
+    lambda df: expected_profit(df, lam_dev, FUNDING_BASE, 1.0, phi_dev) > 0)
+
+rows = []
+for name, rule in policies.items():
+    for sample_name, df in (("development", dev_eng), (f"test {TEST_YEAR}", test_eng)):
+        rows.append({"policy": name, "sample": sample_name, **evaluate(df, rule(df))})
+print("\nPolicies fixed on development, evaluated on development and out of time:")
+print(pd.DataFrame(rows).round(4).to_string(index=False))
+# How to read: the 'test' rows are the honest result. If realised profit is negative there, the
+# policy would have lost money even though it looked profitable on paper; compare bad_rate with the
+# risk appetite and mean_pd with bad_rate to see how much of the problem is PD under-prediction.
+
 # %% 10. LIMITATIONS (to report with the recommendation)
 # 1. Selection bias: only approved loans are observed; conclusions apply to that population
 #    (reject inference is not attempted).
 # 2. Single credit cycle: 2012-2015 was a benign period; a downturn would raise PDs.
 #    The PD stress scenario is a rough proxy, not a forecast.
-# 3. Simplified economics: EAD equals the original amount, LGD is a constant assumption,
-#    funding cost is a flat assumption, operating costs and early repayments are ignored.
+# 3. Simplified economics: EAD equals the original amount, funding cost is a flat assumption,
+#    operating costs, collection costs and late fees are ignored. Prepayment and the net loss
+#    on defaults are measured on development vintages and assumed stable afterwards (section 9.1
+#    compares them with the test vintage).
 # 4. Observations may not be independent (a borrower can hold several loans).
 # 5. Structurally missing variables (months since last delinquency / public record) were
 #    excluded; a WoE scorecard with a "never" category could recover that information.
 # 6. Predictive association is not causation: coefficients describe who tends to default,
 #    not why.
+# 7. Drift: a model fitted on 2012-2014 can under-predict a later vintage even when it still
+#    ranks borrowers well (section 6, drift table). PDs need recalibration before use, and the
+#    cut-off must be reviewed whenever the observed bad rate moves away from the mean PD.
+# 8. The policy covers the 36-month product only; 60-month loans have roughly double the
+#    bad rate and are out of scope.
+# 9. The cut-off is very sensitive to the funding-cost, LGD and PD assumptions (section 9.2):
+#    report it as a range, never as a single number.
+
+
+# %% 11. RUN LOG
+# One row per run, appended to run_log.csv next to the data. It lets us compare specifications
+# (for example DEV_YEARS = (2012, 2014) versus (2013, 2014)) without re-reading old outputs.
+log_row = pd.DataFrame([{
+    "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    "dev_years": f"{DEV_YEARS[0]}-{DEV_YEARS[1]}",
+    "test_year": TEST_YEAR,
+    "n_dev": len(dev_eng),
+    "n_test": len(test_eng),
+    "n_variables": len(final_num) + len(final_cat),
+    "variables": ";".join(final_num + final_cat),
+    "auc_test": round(auc_test, 4),
+    "gini_test": round(2 * auc_test - 1, 4),
+    "ks_test": round(ks_stat(y_test, pd_test), 4),
+    "mean_pd_test": round(pd_test.mean(), 4),
+    "bad_rate_test": round(y_test.mean(), 4),
+    "calib_intercept": round(cal_fit.params.iloc[0], 4),
+    "calib_slope": round(cal_fit.params.iloc[1], 4),
+}])
+log_path = PATH.parent / "run_log.csv"
+log_row.to_csv(log_path, mode="a", header=not log_path.exists(), index=False)   # write the header only once
+print("\nRun logged to", log_path)
+print(log_row.T.to_string(header=False))
