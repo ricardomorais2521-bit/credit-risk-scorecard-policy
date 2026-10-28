@@ -45,6 +45,19 @@
 #                     (1 - PD) x interest income - PD x LGD x EAD - funding cost
 # Realised profit Profit computed AFTER outcomes are known, from the cash actually
 #                 received. Used to check whether expected profit is realistic.
+# Prepayment      Borrowers who repay early earn the lender LESS interest than the
+#                 contract promised. Contractual interest therefore overstates income.
+# Net loss rate   For defaulted loans: (amount lent - cash received before and after
+#                 default) / amount lent. It is the measured counterpart of LGD (it
+#                 already counts instalments paid before the default).
+# Profit bridge   Step-by-step replacement of each assumption by what really happened,
+#                 to see which assumption explains the gap between expected and
+#                 realised profit.
+# Break-even rule Approve a loan only if its expected profit is positive. The cut-off
+#                 then comes from the economics, not from an arbitrary risk appetite.
+# Ex-ante policy  A policy whose parameters are fixed using development data only, then
+#                 evaluated on the test vintage. Choosing the cut-off on the test data
+#                 itself would make the test result optimistic.
 #
 # --- A2. Sample and data concepts --------------------------------------------
 # Vintage         Group of loans granted in the same period (here: calendar year
@@ -129,6 +142,10 @@
 #                   - Calibration table by PD decile.
 #                   - Calibration slope and intercept (ideal: 1 and 0).
 #                   - Brier score: mean squared error of the PDs (lower is better).
+# Covariate shift The mix of applicants changes (mean PD moves).
+# Concept drift   The mix is the same but the risk of the same profile changes (mean PD
+#                 stable, observed bad rate moves). A model fitted on the past then
+#                 under- or over-predicts, even though it still ranks borrowers well.
 # Bootstrap       Resample the test set with replacement many times to get a
 #                 confidence interval for a metric (here AUC).
 # Sensitivity     Re-run the decision under different assumptions (funding cost,
@@ -225,6 +242,10 @@
 # 11. Model works on a later period             -> section 6 (out-of-time test)
 # 12. Predicted PDs are calibrated              -> section 6 (calibration)
 # 13. Cost assumptions (LGD, funding) hold      -> section 9 (sensitivity)
+# 14. Economics (interest actually earned, net  -> section 9.1 (measured on development
+#     loss on defaults) are stable over time        vintages, checked against the test one)
+# 15. The policy is fixed BEFORE seeing the     -> section 9.4 (ex-ante policies)
+#     test outcomes
 # No class re-weighting is applied: re-weighting would distort the PDs, and we
 # need honest PDs for the expected-loss and profit calculations.
 
@@ -234,6 +255,7 @@
 # #############################################################################
 
 # %% 0. Imports and configuration
+from datetime import datetime                 # timestamp for the run log
 from pathlib import Path                      # object-oriented file paths (works on Windows and Linux)
 
 import numpy as np                            # numerical arrays and maths
@@ -267,7 +289,8 @@ CORR_MAX = 0.70       # |Spearman| at or above this means two variables are redu
 VIF_MAX = 5.0         # variables above this VIF are removed one at a time
 WINSOR = (0.01, 0.99) # percentiles used to cap outliers
 SKEW_MAX = 1.0        # skewness above this triggers a log1p transform
-RARE_LEVEL = 0.01     # categories below 1% of the training data are grouped into "OTHER"
+RARE_LEVEL = 0.01     # categories below 1% of the training data are pooled into one "RARE" group
+                      # (named RARE, not OTHER, because OTHER/other are real Lending Club categories)
 IV_BINS = 10          # number of quantile bins for IV (and for decile tables)
 
 # ---- Economic assumptions (Q2) -----------------------------------------------
@@ -345,7 +368,8 @@ print(data["loan_status"].value_counts())      # shows every status so the targe
 DATE_COLS = ["issue_d", "earliest_cr_line", "last_pymnt_d"]
 ORDINAL_COLS = ["term", "emp_length", "grade", "sub_grade"]   # categories with a natural order
 ID_COLS = ["id"]
-DISCRETE_MAX_UNIQUE = 50      # integer-valued numeric with <= 50 distinct values -> discrete
+DISCRETE_MAX_UNIQUE = 200     # integer-valued numeric with <= 200 distinct values -> discrete
+                              # (counts such as total_acc have ~150 distinct values)
 
 
 def var_type(s):
@@ -501,6 +525,12 @@ print("\nSpearman(fico_range_low, fico_range_high) =",
 constants = [c for c in ["term", "application_type"] if dev_eng[c].nunique(dropna=True) <= 1]
 print("Constant in the development set (excluded):", constants)
 
+# application_type is constant in development, so the model cannot learn about joint applications.
+# If joint applications appear in the test vintage, the test population differs from the training one.
+in_window = pop_eng[pop_eng["vintage"].between(DEV_YEARS[0], TEST_YEAR)]
+print("\nApplication type mix by vintage (share of loans):")
+print(pd.crosstab(in_window["vintage"], in_window["application_type"], normalize="index").round(4).to_string())
+
 # ---- Missing % by vintage ----------------------------------------------------
 # Some bureau variables were only collected from certain dates, so they can be 100% missing
 # in early vintages. If a variable is missing for whole vintages, median imputation would
@@ -615,7 +645,7 @@ class Preprocessor:
     """Learns preprocessing parameters on the development set and applies them unchanged to any other set.
     Fitting on development only and re-using the parameters on test is what avoids leakage.
     Numeric steps: winsorise -> log1p if skewed -> median imputation -> standardisation.
-    Categorical steps: group rare levels into OTHER -> one-hot encoding (most frequent level = reference)."""
+    Categorical steps: pool rare levels into RARE -> one-hot encoding (most frequent level = reference)."""
 
     def __init__(self, numeric, categorical):
         self.numeric = list(numeric)            # numeric variables to process
@@ -642,7 +672,7 @@ class Preprocessor:
             s = df[c].astype(object).where(df[c].notna(), "MISSING")  # missing becomes its own category
             freq = s.value_counts(normalize=True)                     # share of each category
             keep = freq[freq >= RARE_LEVEL].index.tolist()            # categories above the rarity threshold
-            grouped = s.where(s.isin(keep), "OTHER")                  # rare ones -> OTHER
+            grouped = s.where(s.isin(keep), "RARE")                   # rare ones -> RARE
             counts = grouped.value_counts()                           # sorted by frequency
             self.keep_levels[c] = keep
             self.reference[c] = counts.index[0]                       # most frequent level is the baseline
@@ -660,7 +690,7 @@ class Preprocessor:
             out[c] = (s - p["mean"]) / p["std"]                       # same standardisation
         for c in self.categorical:
             s = df[c].astype(object).where(df[c].notna(), "MISSING")
-            s = s.where(s.isin(self.keep_levels[c]), "OTHER")         # unseen/rare levels -> OTHER
+            s = s.where(s.isin(self.keep_levels[c]), "RARE")          # unseen/rare levels -> RARE
             for lvl in self.dummy_levels[c]:
                 out[f"{c}={lvl}"] = (s == lvl).astype(float)          # 1 if the loan has this category
         return out
@@ -723,6 +753,8 @@ print(coef_table.reindex(coef_table["z"].abs().sort_values(ascending=False).inde
 # Predicted PDs for development and test.
 pd_dev = np.asarray(result.predict(sm.add_constant(X_dev, has_constant="add")))
 pd_test = np.asarray(result.predict(sm.add_constant(X_test, has_constant="add")))
+dev_eng["pd"] = pd_dev                                        # keep PDs next to the loans (used in sections 6 and 9)
+test_eng["pd"] = pd_test
 
 # ---- Linearity in the log-odds (assumption 6) --------------------------------
 # For each numeric variable: bad rate by decile of the RAW variable. A roughly monotonic
@@ -787,7 +819,6 @@ cal_fit = sm.Logit(y_test, sm.add_constant(pd.DataFrame({"logit_pd": logit_pd}))
 print(f"Calibration intercept = {cal_fit.params.iloc[0]:+.3f} (ideal 0) | slope = {cal_fit.params.iloc[1]:.3f} (ideal 1)")
 
 # Calibration table by PD decile on the test set.
-test_eng["pd"] = pd_test                                       # store PDs on the test table
 test_eng["pd_decile"] = pd.qcut(test_eng["pd"], 10, labels=False, duplicates="drop") + 1   # 1 = safest
 cal_table = test_eng.groupby("pd_decile").agg(loans=("bad", "size"), mean_pd=("pd", "mean"), observed_bad_rate=("bad", "mean"))
 print("\nCalibration by PD decile (test):")
@@ -804,6 +835,52 @@ plt.legend()
 plt.grid(alpha=0.3)
 plt.tight_layout()
 plt.show()
+
+# ---- Drift: did the applicants change, or did the risk of the same applicants change? ----
+# Covariate shift: mean PD changes (different mix of applicants).
+# Concept drift:   mean PD is stable but the observed bad rate moves (same profile, higher risk).
+# mean_int_rate is Lending Club's own pricing of risk: if it rises while our mean PD does not,
+# Lending Club saw risk (through variables we do not use) that our model cannot see.
+both = pd.concat([dev_eng[["vintage", "bad", "pd", "int_rate"]], test_eng[["vintage", "bad", "pd", "int_rate"]]])
+drift = both.groupby("vintage").agg(loans=("bad", "size"), observed_bad_rate=("bad", "mean"),
+                                    mean_pd=("pd", "mean"), mean_int_rate=("int_rate", "mean"))
+drift["observed_minus_pd_pp"] = (drift["observed_bad_rate"] - drift["mean_pd"]) * 100
+print("\nDrift by vintage (development vintages are in-sample, so their gap is ~0 by construction):")
+print(drift.round(4).to_string())
+
+# ---- Benchmark: Lending Club's own risk output on the same test loans ----------
+# Without a reference we cannot say whether a Gini of ~0.30 is weak or normal for this data.
+# int_rate and grade are NOT model inputs; here they are only compared with our PD.
+GRADE_NUM = {g: i for i, g in enumerate("ABCDEFG", start=1)}   # A (safest) = 1 ... G (riskiest) = 7
+dev_eng["grade_num"] = dev_eng["grade"].astype(str).map(GRADE_NUM)
+test_eng["grade_num"] = test_eng["grade"].astype(str).map(GRADE_NUM)
+
+scores_test = {
+    "Our scorecard (PD)": pd_test,
+    "Lending Club int_rate": test_eng["int_rate"].to_numpy(),
+    "Lending Club grade (A=1..G=7)": test_eng["grade_num"].to_numpy(),
+}
+rows = []
+for name, s in scores_test.items():
+    a = roc_auc_score(y_test, s)                               # higher score = riskier for all three
+    rows.append({"score": name, "AUC_test": a, "Gini_test": 2 * a - 1, "KS_test": ks_stat(y_test, np.asarray(s, dtype=float))})
+
+# Incremental information: combine our PD (on the log-odds scale) with int_rate, fitted on development.
+def to_logit(p):
+    p = np.clip(np.asarray(p, dtype=float), 1e-6, 1 - 1e-6)    # avoid log(0)
+    return np.log(p / (1 - p))
+
+comb_dev = pd.DataFrame({"logit_pd": to_logit(pd_dev), "int_rate": dev_eng["int_rate"].to_numpy()})
+comb_test = pd.DataFrame({"logit_pd": to_logit(pd_test), "int_rate": test_eng["int_rate"].to_numpy()})
+comb = sm.Logit(y_dev, sm.add_constant(comb_dev)).fit(disp=0)
+p_comb = np.asarray(comb.predict(sm.add_constant(comb_test, has_constant="add")))
+a = roc_auc_score(y_test, p_comb)
+rows.append({"score": "Our PD + Lending Club int_rate (fitted on dev)", "AUC_test": a,
+             "Gini_test": 2 * a - 1, "KS_test": ks_stat(y_test, p_comb)})
+print("\nBenchmark against Lending Club's own risk output (test):")
+print(pd.DataFrame(rows).round(4).to_string(index=False))
+# Reading guide: if the combined score beats int_rate alone, our variables add information beyond
+# Lending Club's pricing; if int_rate alone beats ours, Lending Club used information we do not have.
 
 
 # %% 7. ANSWER TO QUESTION 1  (written from the numbers, as associations)
