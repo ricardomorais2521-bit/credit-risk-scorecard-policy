@@ -1,0 +1,65 @@
+------------------------- Personal Loans Credit Policy: Simplified Scorecard -------------------------
+
+---Business context---
+A consumer lender wants to evaluate an internal, data-driven approval policy for its unsecured
+personal loan product. Management needs a transparent model to:
+(a) Rank applicants objectively by credit risk, using only their application data.
+(b) Set an approval threshold that balances commercial growth (approval volume), portfolio
+    default risk and profitability.
+The Lending Club accepted-loans dataset serves as the historical origination database.
+
+
+---Objective---
+Build an interpretable credit scoring model to predict default risk, and use it to determine the
+approval cut-off that keeps portfolio defaults within an acceptable risk appetite while remaining
+profitable.
+
+
+---Scope and key assumptions---
+Population:   36-month loans only, ensuring all included contracts have reached a terminal outcome.
+Time window:  Vintages 2012-2014 for model development (training), 2015 for out-of-time
+              evaluation (testing). Provisional: confirmed once data availability by vintage is checked.
+              Vintages from 2016 onward are excluded due to right-censoring (outcomes not yet
+              observed). Vintages 2007-2011 are excluded due to low volume and distinct economic
+              conditions.
+Target:       Bad (1) = Charged Off or Default; Good (0) = Fully Paid.
+              Active loans ("Current") are excluded because their outcome is not yet known.
+Features:     Application-time information only (income, loan amount, DTI, credit history).
+              Post-origination fields (payments, recoveries, status flags) are excluded to
+              prevent data leakage.
+Exclusions:   Lending Club's own rating and pricing fields (grade, sub_grade, int_rate) are not
+              model inputs: they already embed the lender's own risk assessment, so using them
+              would make the model circular. int_rate and installment are used only to price
+              loans in the profit calculation.
+Economics:    Expected profit per loan = expected interest income - expected credit loss
+              (PD x LGD x EAD) - funding cost. LGD is fixed at a conservative 60-70% and funding
+              cost is an explicit assumption.
+
+
+---Core business questions---
+
+Question 1: Who poses the highest risk of non-payment? (Risk and Discrimination)
+"Based on customer information available at the time of application (income, debt-to-income
+ratio, credit history), can we predict who will default, and how well?"
+   - Which variables best separate good from bad borrowers (IV), and how do they relate to risk?
+   - What discriminatory power does the model achieve out of time (AUC, Gini, KS)?
+   - Are the predicted probabilities well calibrated against observed default rates?
+   The answer is written from the results (coefficients, IV and metrics), describing
+   associations with default risk, not causes.
+
+Question 2: Where do we set the approval threshold to avoid losing money? (Policy and Decision)
+"If we set a maximum risk tolerance (a cut-off on the score), what share of applicants do we
+approve, what default rate does the approved portfolio have, and which cut-off maximises
+expected profit?"
+   - Approval rate vs. bad rate for cut-offs defined by score percentiles, compared with the
+     baseline (bad rate when approving everyone).
+   - Expected profit by cut-off, and how sensitive the best cut-off is to the funding cost
+     assumption.
+
+
+---Notebook structure---
+1. EDA: columns, observations and variable types
+2. Target, population and vintages: bad rate by vintage, share of resolved loans, baseline risk
+3. Variable availability: missing values by vintage
+4. Variable selection: IV, correlation and VIF
+5. Model: logistic regression
